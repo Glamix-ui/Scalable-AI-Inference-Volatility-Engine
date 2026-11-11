@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Volatility Engine: live inference dashboard</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Fragment+Mono&family=Instrument+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root{--ink:#0b1220;--panel:#111a2e;--line:#1f2d4a;--req:#5eb1ff;--fc:#ffb454;--ok:#5fd4a0;--bad:#ff6b6b;--mut:#8a9bbd}
+body{background:var(--ink);color:#e6ecf8;font-family:'Instrument Sans',system-ui,sans-serif}
+.num{font-family:'Fragment Mono',ui-monospace,monospace;font-variant-numeric:tabular-nums}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px}
+.btn{border:1px solid var(--line);border-radius:8px;padding:.45rem .9rem;font-weight:600;transition:background .15s}
+.btn:hover{background:#18253f}.btn:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px solid var(--req);outline-offset:2px}
+.btn-primary{background:var(--req);color:#06101f;border-color:var(--req)}.btn-primary:hover{background:#82c4ff}
+select,textarea{background:#0d1526;border:1px solid var(--line);border-radius:8px;padding:.45rem .6rem}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--req);display:inline-block;margin:2px}
+.lane{min-height:92px;max-height:150px;overflow:hidden;display:flex;flex-wrap:wrap;align-content:flex-start}
+.batch{border:1px solid var(--req);border-radius:8px;padding:6px 8px;animation:land .25s ease-out}
+.batch .dot{width:6px;height:6px;margin:1px;background:var(--ok)}
+@keyframes land{from{transform:translateY(-10px);opacity:0;border-color:var(--fc)}to{transform:none;opacity:1}}
+@media (prefers-reduced-motion:reduce){.batch{animation:none}}
+</style>
+</head>
+<body class="min-h-screen">
+<header class="max-w-7xl mx-auto px-4 pt-6 pb-4 flex flex-wrap items-end justify-between gap-3">
+  <div>
+    <h1 class="text-2xl font-bold tracking-tight">Volatility Engine</h1>
+    <p class="text-sm" style="color:var(--mut)">Next-5-day volatility from a PyTorch GRU. Requests are grouped into batches before inference.</p>
+  </div>
+  <div class="text-sm flex items-center gap-2" style="color:var(--mut)"><span id="conn" class="dot" style="background:var(--bad)"></span><span id="connTxt">Connecting to live stream</span></div>
+</header>
+
+<main class="max-w-7xl mx-auto px-4 pb-10 grid lg:grid-cols-3 gap-4">
+  <section class="lg:col-span-2 space-y-4">
+    <div class="panel p-4 flex flex-wrap items-center gap-3">
+      <select id="ticker" aria-label="Ticker">
+        <option>AAPL</option><option>TSLA</option><option>NVDA</option><option>MSFT</option><option>AMZN</option><option>GOOGL</option><option>META</option><option>JPM</option><option>SPY</option>
+      </select>
+      <button id="predict" class="btn btn-primary">Predict volatility</button>
+      <label class="flex items-center gap-2 text-sm"><input id="live" type="checkbox"> Auto-refresh every 2 s</label>
+      <button id="customToggle" class="btn text-sm ml-auto">Use my own prices</button>
+      <div id="customBox" class="w-full hidden">
+        <textarea id="closes" rows="3" class="w-full num text-xs" placeholder="Paste at least 60 daily closing prices, oldest first, separated by commas or spaces"></textarea>
+        <p id="customErr" class="text-sm" style="color:var(--bad)"></p>
+      </div>
+    </div>
+
+    <div class="grid sm:grid-cols-4 gap-3">
+      <div class="panel p-4"><div class="text-sm" style="color:var(--mut)">Predicted volatility</div><div id="pv" class="num text-3xl mt-1" style="color:var(--fc)">–</div><div class="text-xs" style="color:var(--mut)">annualized, next 5 days</div></div>
+      <div class="panel p-4"><div class="text-sm" style="color:var(--mut)">Risk level</div><div id="risk" class="text-3xl font-bold mt-1">–</div><div id="src" class="text-xs" style="color:var(--mut)">&nbsp;</div></div>
+      <div class="panel p-4"><div class="text-sm" style="color:var(--mut)">1-day VaR (95%)</div><div id="var" class="num text-3xl mt-1">–</div><div class="text-xs" style="color:var(--mut)">of position value</div></div>
+      <div class="panel p-4"><div class="text-sm" style="color:var(--mut)">20-day benchmark</div><div id="bv" class="num text-3xl mt-1">–</div><div id="mae" class="text-xs" style="color:var(--mut)">&nbsp;</div></div>
+    </div>
+
+    <div class="panel p-3"><div class="text-sm px-1 pb-2" style="color:var(--mut)">Price (daily candles)</div><div id="c1" style="height:300px"></div></div>
+    <div class="panel p-3"><div class="text-sm px-1 pb-2" style="color:var(--mut)">20-day realized volatility (%) with the model forecast as the amber line</div><div id="c2" style="height:200px"></div></div>
+  </section>
+
+  <aside class="space-y-4">
+    <div class="panel p-4">
+      <div class="flex items-center justify-between mb-3"><h2 class="font-semibold">Latency</h2><span class="text-xs" style="color:var(--mut)">last 2,000 requests</span></div>
+      <div class="grid grid-cols-3 gap-3">
+        <div><div class="text-xs" style="color:var(--mut)">P50</div><div class="num text-2xl"><span id="p50">–</span><span class="text-sm"> ms</span></div></div>
+        <div><div class="text-xs" style="color:var(--mut)">P99</div><div class="num text-2xl"><span id="p99">–</span><span class="text-sm"> ms</span></div></div>
+        <div><div class="text-xs" style="color:var(--mut)">Throughput</div><div class="num text-2xl"><span id="rps">–</span><span class="text-sm"> /s</span></div></div>
+        <div><div class="text-xs" style="color:var(--mut)">Avg batch</div><div class="num text-xl" id="avgb">–</div></div>
+        <div><div class="text-xs" style="color:var(--mut)">Inference</div><div class="num text-xl"><span id="inf">–</span> ms</div></div>
+        <div><div class="text-xs" style="color:var(--mut)">Served</div><div class="num text-xl" id="total">0</div></div>
+      </div>
+    </div>
+
+    <div class="panel p-4">
+      <div class="flex items-center justify-between mb-2"><h2 class="font-semibold">Batching queue</h2><span class="text-sm" style="color:var(--mut)">waiting: <span id="depth" class="num">0</span></span></div>
+      <div id="lane" class="lane" aria-label="Requests waiting in the queue"></div>
+      <h3 class="text-sm mt-3 mb-2" style="color:var(--mut)">Batches sent to the model</h3>
+      <div id="batches" class="flex flex-col gap-2 max-h-72 overflow-hidden"></div>
+      <p id="empty" class="text-sm" style="color:var(--mut)">Press Send 100 requests to watch them get grouped.</p>
+    </div>
+
+    <div class="panel p-4 flex flex-wrap gap-2">
+      <button id="burst" class="btn btn-primary">Send 100 requests</button>
+      <button id="toggle" class="btn">Batching: on</button>
+      <p id="burstMsg" class="w-full text-sm" style="color:var(--mut)">Turn batching off and send again to compare P99 and throughput.</p>
+    </div>
+  </aside>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+const post = (u, b) => fetch(u, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(b)});
+const opts = h => ({height: h, autoSize: true, layout: {background: {color: 'transparent'}, textColor: '#8a9bbd'},
+  grid: {vertLines: {color: '#182440'}, horzLines: {color: '#182440'}}, rightPriceScale: {borderColor: '#1f2d4a'}, timeScale: {borderColor: '#1f2d4a'}});
+const ch1 = LightweightCharts.createChart($('#c1'), opts(300));
+const candle = ch1.addCandlestickSeries({upColor: '#5fd4a0', downColor: '#ff6b6b', borderVisible: false, wickUpColor: '#5fd4a0', wickDownColor: '#ff6b6b'});
+const ch2 = LightweightCharts.createChart($('#c2'), opts(200));
+const volLine = ch2.addLineSeries({color: '#5eb1ff', lineWidth: 2});
+let fcLine = null, batching = true, health = null;
+
+async function loadCandles() {
+  const r = await fetch('/api/candles/' + $('#ticker').value);
+  if (!r.ok) return;
+  const d = await r.json();
+  candle.setData(d.candles); volLine.setData(d.vol);
+  ch1.timeScale().fitContent(); ch2.timeScale().fitContent();
+  $('#src').textContent = d.source === 'live' ? 'Live market data' : 'Demo data (market feed unavailable)';
+}
+
+function readCloses() {
+  if ($('#customBox').classList.contains('hidden')) return null;
+  const v = $('#closes').value.split(/[\s,;]+/).filter(Boolean).map(Number);
+  return v.length ? v : null;
+}
+
+async function predict() {
+  $('#customErr').textContent = '';
+  const body = {ticker: $('#ticker').value}, closes = readCloses();
+  if (closes) body.closes = closes;
+  const r = await post('/api/predict', body), d = await r.json();
+  if (!r.ok) { $('#customErr').textContent = d.detail || 'Request failed.'; return; }
+  $('#pv').textContent = (d.predicted_vol * 100).toFixed(1) + '%';
+  $('#bv').textContent = (d.baseline_vol * 100).toFixed(1) + '%';
+  $('#var').textContent = (d.var_95_1d * 100).toFixed(2) + '%';
+  const rk = $('#risk'); rk.textContent = d.risk;
+  rk.style.color = {Low: '#5fd4a0', Moderate: '#e6ecf8', High: '#ffb454', Extreme: '#ff6b6b'}[d.risk];
+  if (d.source === 'custom') $('#src').textContent = 'Your own price data';
+  if (fcLine) volLine.removePriceLine(fcLine);
+  fcLine = volLine.createPriceLine({price: d.predicted_vol * 100, color: '#ffb454', lineWidth: 2, lineStyle: 2, title: 'forecast'});
+}
+
+// ---- live stream (Server-Sent Events) ----
+const dots = new Map();
+function connect() {
+  const es = new EventSource('/api/events');
+  es.onopen = () => { $('#conn').style.background = '#5fd4a0'; $('#connTxt').textContent = 'Live'; };
+  es.onerror = () => { $('#conn').style.background = '#ff6b6b'; $('#connTxt').textContent = 'Reconnecting'; };
+  es.onmessage = e => {
+    const m = JSON.parse(e.data);
+    if (m.type === 'enqueue') {
+      const d = document.createElement('i'); d.className = 'dot';
+      $('#lane').append(d); dots.set(m.id, d);
+      while ($('#lane').childElementCount > 400) $('#lane').firstChild.remove();
+    } else if (m.type === 'batch') {
+      m.ids.forEach(id => { dots.get(id)?.remove(); dots.delete(id); });
+      $('#empty').remove?.();
+      const b = document.createElement('div'); b.className = 'batch text-sm';
+      b.innerHTML = `<div class="flex justify-between"><span>Batch #${m.n}</span><span class="num">${m.size} requests, ${m.infer_ms} ms</span></div><div>${'<i class="dot"></i>'.repeat(Math.min(m.size, 64))}</div>`;
+      $('#batches').prepend(b);
+      while ($('#batches').childElementCount > 6) $('#batches').lastChild.remove();
+    } else if (m.type === 'stats') {
+      for (const [k, id] of [['p50','p50'],['p99','p99'],['rps','rps'],['avg_batch','avgb'],['avg_infer_ms','inf'],['total','total'],['queue_depth','depth']]) $('#' + id).textContent = m[k];
+      batching = m.batching; $('#toggle').textContent = 'Batching: ' + (batching ? 'on' : 'off');
+    }
+  };
+}
+
+$('#predict').onclick = predict;
+$('#ticker').onchange = () => { loadCandles().then(predict); };
+$('#toggle').onclick = () => post('/api/config', {batching: !batching});
+$('#customToggle').onclick = () => $('#customBox').classList.toggle('hidden');
+$('#burst').onclick = async () => {
+  $('#burst').disabled = true;
+  const body = {ticker: $('#ticker').value}, closes = readCloses(); if (closes) body.closes = closes;
+  const t = performance.now();
+  await Promise.all(Array.from({length: 100}, () => post('/api/predict', body)));
+  $('#burstMsg').textContent = `100 requests finished in ${(performance.now() - t).toFixed(0)} ms with batching ${batching ? 'on' : 'off'}.`;
+  $('#burst').disabled = false;
+};
+let timer = null;
+$('#live').onchange = e => { clearInterval(timer); if (e.target.checked) timer = setInterval(predict, 2000); };
+
+fetch('/health').then(r => r.json()).then(h => {
+  if (h.model?.val_mae) $('#mae').textContent = `Model error ${(h.model.val_mae * 100).toFixed(1)} pts vs ${(h.model.baseline_mae * 100).toFixed(1)} pts`;
+});
+connect(); loadCandles().then(predict);
+</script>
+</body>
+</html>
